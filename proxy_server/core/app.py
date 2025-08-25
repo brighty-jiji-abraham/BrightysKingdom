@@ -61,6 +61,10 @@ def create_app(config_class=Config):
         
         logger.info('🔍' + '='*50)
 
+        content_length = request.environ.get('CONTENT_LENGTH')
+        if content_length and int(content_length) > 100 * 1024 * 1024:  # 100MB+
+            logger.info(f"🔍 Large request detected: {content_length} bytes")
+
     @app.after_request
     def after_request(response):
         """Log response information"""
@@ -88,6 +92,14 @@ def create_app(config_class=Config):
     # Store services in app context
     app.monitoring_service = monitoring_service
     app.health_service = health_service
+
+    app.config.update({
+        'MAX_CONTENT_LENGTH': 1024 * 1024 * 1024,  # 1GB limit
+        'REQUEST_TIMEOUT': 300,                     # 5 minutes for regular requests
+        'LARGE_FILE_TIMEOUT': 1800,                # 30 minutes for large files
+        'UPLOAD_FOLDER': 'temp_uploads/',
+        'SEND_FILE_MAX_AGE_DEFAULT': 0
+    })
 
     # Link health service with load balancer
     with app.app_context():
