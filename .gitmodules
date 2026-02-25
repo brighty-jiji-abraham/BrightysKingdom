@@ -1,0 +1,3 @@
+[submodule "FrontEnd/Proxy-Management"]
+	path = FrontEnd/Proxy-Management
+	url = https://github.com/ahmedz1dane/Proxy-Management.git
