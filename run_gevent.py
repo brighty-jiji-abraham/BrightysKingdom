@@ -17,9 +17,24 @@ class CompleteSocketIOHandler(WebSocketHandler):
     """Complete Socket.IO WebSocket handler that bypasses Flask routing"""
     
     def upgrade_websocket(self):
-        """WebSocket upgrade with immediate Socket.IO handling"""
+        """WebSocket upgrade with immediate Socket.IO handling.
+
+        NOTE: this overrides an *internal* geventwebsocket method —
+        WebSocketHandler.run_application() calls self.upgrade_websocket() for
+        every WebSocket upgrade it sees, not just the ones handle_one_response
+        intercepts below. So without the guard, the hand-rolled handshake here
+        would also fire for non-Socket.IO sockets (e.g. /ollama-agent), writing
+        a second raw 101 response on top of geventwebsocket's own. The client
+        then reads that HTTP text as a frame and dies with "rsv is not
+        implemented", and pywsgi trips `assert self.result is None`.
+
+        Anything that isn't Socket.IO goes back to the stock implementation.
+        """
+        if '/socket.io/' not in self.environ.get('PATH_INFO', ''):
+            return super().upgrade_websocket()
+
         print(f"🔧 GEVENT: Starting complete Socket.IO WebSocket upgrade")
-        
+
         try:
             # Validate WebSocket headers
             ws_key = self.headers.get('Sec-WebSocket-Key')
@@ -249,7 +264,7 @@ class WindowsWebSocketWrapper:
 def main():
     print("🚀 Starting Flask Reverse Proxy Server with WebSocket Support")
     print("🔧 DNS Fix Applied: EVENTLET_NO_GREENDNS=yes")
-    
+
     # Create server with complete Socket.IO handler
     http_server = WSGIServer(
         ('0.0.0.0', 2000),
@@ -257,7 +272,14 @@ def main():
         handler_class=CompleteSocketIOHandler,
         environ={'wsgi.multithread': True}
     )
-    
+
+    # Dial out to the public tunnel head, if one is configured. This is what
+    # makes every local service behind this proxy reachable from the internet
+    # without exposing this machine. No-op when TUNNEL_SERVER_URL is unset.
+    from proxy_server.core.tunnel_client import start_in_background
+    if start_in_background():
+        print("🌍 Tunnel client started — local services are being published")
+
     try:
         print("✅ Server ready with COMPLETE Socket.IO WebSocket support")
         print("📍 Server: http://0.0.0.0:2000")

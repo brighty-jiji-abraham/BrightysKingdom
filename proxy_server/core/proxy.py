@@ -162,6 +162,10 @@ class ProxyCore:
             else:
                 data = None
                 
+            # stream=True defers reading the body so we can decide, from the
+            # response headers, whether to relay it chunk-by-chunk or buffer
+            # it. It does NOT change behaviour for buffered responses —
+            # _create_response still reads resp.content in full.
             resp = self.session.request(
                 request.method,
                 target,
@@ -170,16 +174,61 @@ class ProxyCore:
                 data=data,
                 cookies=request.cookies,
                 allow_redirects=False,
-                timeout=current_app.config.get("REQUEST_TIMEOUT", 300),
-                stream=False
+                timeout=self._timeout_for(path),
+                stream=True
             )
-            
+
+            if self._should_stream(path, resp):
+                logger.info(f"📡 Streaming response for {path}")
+                return self._create_streaming_response(resp, start, path)
+
             return self._create_response(resp, start, path)
-            
+
         except Exception as e:
             logger.error(f"Standard request failed: {e}")
             self._record_metrics(path, 500, time.time() - start)
             return {"error": f"Request failed: {str(e)}"}, 502
+
+
+    def _should_stream(self, path: str, resp) -> bool:
+        """Decide whether this response must be relayed incrementally.
+
+        Buffering an LLM response is not merely slower, it is wrong: the caller
+        sits silent for the whole generation and then receives every token at
+        once, so token-by-token rendering never happens. Two signals:
+
+        1. Content-Type — text/event-stream (OpenAI-compatible chat) and
+           application/x-ndjson (Ollama's native streaming, e.g. /api/pull).
+        2. Route prefix — configured in STREAMING_ROUTES, so a backend that
+           streams without a distinctive content type still works.
+        """
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        streaming_types = current_app.config.get(
+            "STREAMING_CONTENT_TYPES", ("text/event-stream", "application/x-ndjson"))
+        if any(ct in content_type for ct in streaming_types):
+            return True
+
+        # A backend that omits Content-Length is streaming by definition.
+        if "content-length" not in {k.lower() for k in resp.headers} and resp.status_code == 200:
+            for prefix in current_app.config.get("STREAMING_ROUTES", ()):
+                if path.startswith(prefix):
+                    return True
+
+        return False
+
+
+    def _timeout_for(self, path: str):
+        """Per-route timeout.
+
+        The default REQUEST_TIMEOUT is tuned for ordinary web backends and is
+        far too short for model work — a cold 14B load alone runs ~20s before
+        the first token, and an Ollama /api/pull runs for minutes.
+        """
+        default = current_app.config.get("REQUEST_TIMEOUT", 300)
+        for prefix in current_app.config.get("STREAMING_ROUTES", ()):
+            if path.startswith(prefix):
+                return (10, current_app.config.get("STREAMING_READ_TIMEOUT", 600))
+        return default
 
 
     def _create_response(self, resp, start: float, path: str):

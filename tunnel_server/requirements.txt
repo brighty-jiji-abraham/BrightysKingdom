@@ -1,0 +1,17 @@
+# Tunnel head dependencies — deliberately minimal.
+#
+# server.py imports nothing from the rest of BrightysKingdom, so this folder
+# can be copied to the public server on its own. Keep it that way: any new
+# import here is a package someone has to install on production.
+Flask>=3.0.0
+gevent>=24.0.0
+gevent-websocket>=0.10.1
+
+# Used only by the fallback path, to forward upstream when the tunnel is
+# down. Pooled session, streamed responses.
+requests>=2.31.0
+
+# Optional. Without it server.py still runs, it just cannot read .env and
+# every setting must come from the environment (which is how pm2 supplies
+# them). run.sh and start.bat rely on .env, so install it for those.
+python-dotenv>=1.0.1

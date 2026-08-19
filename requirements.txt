@@ -11,3 +11,9 @@ python-engineio>=4.8.0
 websockets>=10.4
 websocket-client
 eventlet
+
+# Required by run_gevent.py, which is the documented way to start the
+# proxy (main.py has no WebSocket support). Without these a fresh
+# `pip install -r requirements.txt` produces an install that cannot start.
+gevent>=24.0.0
+gevent-websocket>=0.10.1

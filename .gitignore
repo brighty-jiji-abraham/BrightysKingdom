@@ -1,2 +1,16 @@
 *.pyc
+__pycache__/
 proxy.log
+proxy.log.*
+logs/
+
+# Virtualenvs
+venv/
+.venv/
+kingdom/
+tunnel_server/venv/
+
+# Tunnel head secrets. NOTE: the root .env is already tracked in this repo
+# (it predates this file), so listing it here would not untrack it — see
+# `git rm --cached .env` if you want it out.
+tunnel_server/.env

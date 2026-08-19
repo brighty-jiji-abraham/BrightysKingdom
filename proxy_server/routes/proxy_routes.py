@@ -360,6 +360,42 @@ def proxy_webhooks_request(app, webhook_service, user):
     return response
 
 
+@proxy_bp.route('/ollama', defaults={'path': ''},
+                methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
+@proxy_bp.route('/ollama/<path:path>',
+                methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
+def proxy_ollama_request(path):
+    """Ollama surface — deliberately NOT behind require_auth.
+
+    The chatbot reaches Ollama two different ways and only one of them can
+    carry a credential:
+
+      * chat  — the OpenAI SDK sends `Authorization: Bearer <key>`, which
+                get_api_key_from_request would accept.
+      * embeddings — langchain_ollama sends no auth header at all and exposes
+                no hook to add one, so require_auth here would 401 every
+                single embed call and break RAG entirely.
+
+    So the protection lives one layer out instead: the tunnel head binds its
+    forwarding surface to a private port and only the token-authenticated
+    /tunnel-agent endpoint faces the internet. If you ever expose this proxy
+    directly, put an IP allowlist in front of /ollama — it is an open door to
+    the GPU otherwise (anyone can generate, /api/pull to fill the disk, or
+    /api/delete the models).
+
+    Declared as its own rule rather than falling through to the catch-all
+    below because Werkzeug prefers the more specific static prefix, so this
+    wins over `/<path:path>` regardless of registration order.
+    """
+    full_path = '/ollama/' + path if path else '/ollama'
+    logger.info(f"Proxying Ollama {request.method} {full_path}")
+    response = proxy_core.forward_request(full_path)
+
+    if hasattr(response, 'headers'):
+        response = security_headers(response)
+    return response
+
+
 @proxy_bp.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
 @require_auth
 def proxy_request(path):

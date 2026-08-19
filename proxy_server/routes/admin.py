@@ -3,6 +3,7 @@ Admin panel routes with API key management
 """
 from flask import Blueprint, current_app, jsonify, request
 from proxy_server.middleware.auth import optional_auth, admin_required, api_key_manager
+from proxy_server.core.proxy import proxy_core
 from proxy_server.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -250,11 +251,44 @@ def validate_api_key():
     
 @admin_bp.route('/websocket-sessions', methods=['GET'])
 def websocket_sessions():
-    """Get WebSocket session statistics"""
-    from proxy_server.core.websocket_proxy import dual_connection_proxy
-    
-    stats = dual_connection_proxy.get_session_stats()
-    return jsonify({
-        'status': 'success',
-        'data': stats
-    })
+    """Get WebSocket session statistics.
+
+    Previously imported `dual_connection_proxy` from `websocket_proxy`, a
+    module that does not exist in this codebase - the endpoint raised
+    ImportError on every call. The real objects are in `websocket_tunnel`.
+    """
+    try:
+        from proxy_server.core.websocket_tunnel import (
+            flask_socketio_proxy,
+            websocket_tunnel,
+        )
+
+        stats = dict(flask_socketio_proxy.get_stats())
+        stats['backend_connections'] = len(
+            getattr(websocket_tunnel, 'backend_connections', {}) or {}
+        )
+        stats['sticky_sessions'] = len(
+            getattr(proxy_core.load_balancer, 'socketio_sessions', {}) or {}
+        )
+        return jsonify({'status': 'success', 'data': stats})
+    except Exception as e:
+        logger.error(f"websocket-sessions failed: {e}")
+        return {'status': 'error', 'error': str(e)}, 500
+
+
+@admin_bp.route('/tunnel', methods=['GET'])
+def tunnel_status():
+    """Outbound tunnel state, as seen from this side.
+
+    The tunnel head's own /_tunnel/* endpoints live on a private port on the
+    public server and are firewalled off from the admin UI's browser. The
+    client running inside this process knows its own health just as well, so
+    the UI reads it from here.
+    """
+    try:
+        from proxy_server.core.tunnel_client import get_status
+
+        return jsonify({'status': 'success', 'data': get_status()})
+    except Exception as e:
+        logger.error(f"tunnel status failed: {e}")
+        return {'status': 'error', 'error': str(e)}, 500
