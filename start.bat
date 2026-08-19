@@ -140,10 +140,13 @@ goto :eof
 :read_env
 REM read_env <file> <key> <target-var> - last assignment wins, quotes stripped
 if not exist %1 goto :eof
+REM %%~B already strips surrounding quotes, so no separate unquoting step is
+REM needed - the `call set` that used to do it produced malformed syntax when
+REM the value was empty, and only the missing-token path ever hit that.
+REM An empty assignment in .env means "not set", so the caller keeps its default.
 for /f "usebackq eol=# tokens=1,* delims==" %%A in (%1) do (
-  if /i "%%~A"=="%~2" set "%~3=%%~B"
+  if /i "%%~A"=="%~2" if not "%%~B"=="" set "%~3=%%~B"
 )
-call set "%~3=%%%~3:"=%%"
 goto :eof
 
 :fe_no_npm
@@ -184,13 +187,19 @@ exit /b 1
 :run_head
 REM Normally the head runs on the PUBLIC server via pm2 (see ecosystem.config.js).
 REM This mode exists so you can exercise the whole chain on one machine.
+REM
+REM Resolution matches run.sh: the environment wins, then .env. Checking only
+REM the shell made this refuse to start a head whose token was in .env - which
+REM is where it belongs, and which server.py reads perfectly well on its own.
 if not "%TUNNEL_TOKEN%"=="" goto :head_ok
-echo [ERROR] TUNNEL_TOKEN is not set in this shell.
+call :read_env "%~dp0.env" TUNNEL_TOKEN TUNNEL_TOKEN
+if not "%TUNNEL_TOKEN%"=="" goto :head_ok
+echo [ERROR] TUNNEL_TOKEN is not set - checked the environment and .env.
 echo         The head refuses every client without it.
 echo.
 echo         Generate one:
 echo             "%PY%" -c "import secrets; print(secrets.token_urlsafe(32))"
-echo         Then:
+echo         Then put it in .env as TUNNEL_TOKEN=... , or for this shell only:
 echo             set TUNNEL_TOKEN=your-token-here
 exit /b 1
 :head_ok

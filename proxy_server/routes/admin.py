@@ -442,6 +442,26 @@ def websocket_sessions():
         return {'status': 'error', 'error': str(e)}, 500
 
 
+@admin_bp.route('/tunnel/requests', methods=['GET'])
+def tunnel_requests():
+    """What has actually crossed the tunnel, plus a per-minute traffic series.
+
+    Held in memory by the tunnel client, so it resets when the proxy restarts.
+    The durable record is the proxy log; this exists so the panel can show
+    activity without anyone reading log files.
+    """
+    try:
+        from proxy_server.core.tunnel_client import get_activity
+
+        limit = request.args.get('limit', 100)
+        return jsonify({'status': 'success', 'data': get_activity(limit)})
+    except ValueError:
+        return {'error': 'limit must be a number'}, 400
+    except Exception as e:
+        logger.error(f"tunnel requests read failed: {e}")
+        return {'error': 'Failed to read tunnel activity', 'detail': str(e)}, 500
+
+
 @admin_bp.route('/tunnel/config', methods=['GET'])
 @admin_required
 def get_tunnel_config():

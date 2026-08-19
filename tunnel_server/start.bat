@@ -75,14 +75,34 @@ exit /b 0
 :run_start
 REM Python buffers stdout when it is not a tty, so unbuffer for pm2/nssm.
 set "PYTHONUNBUFFERED=1"
+
+REM Resolve the real ports rather than printing the defaults and claiming they
+REM came from .env - a banner that names a port the head is not listening on
+REM is worse than no banner.
+set "PUB_PORT=9000"
+set "LOC_PORT=9001"
+call :read_env ".env" TUNNEL_PUBLIC_PORT PUB_PORT
+call :read_env ".env" TUNNEL_LOCAL_PORT LOC_PORT
+
+REM Same resolution as run.sh: environment first, then .env. server.py checks
+REM this too, but failing here says what to do about it.
+if not "%TUNNEL_TOKEN%"=="" goto :start_ok
+call :read_env ".env" TUNNEL_TOKEN TUNNEL_TOKEN
+if not "%TUNNEL_TOKEN%"=="" goto :start_ok
+echo [ERROR] TUNNEL_TOKEN is not set - checked the environment and .env.
+echo         Without it the head refuses every client.
+echo.
+echo             start.bat token       generate one, then put it in .env
+exit /b 1
+:start_ok
+
 echo ===========================================================
 echo  Tunnel head
 echo ===========================================================
-echo  Public port  9000  /tunnel-agent   token-authenticated
-echo  Local  port  9001  forwarding      KEEP OFF THE INTERNET
-echo  Status       http://127.0.0.1:9001/_tunnel/status
+echo  Public port  %PUB_PORT%  /tunnel-agent   token-authenticated
+echo  Local  port  %LOC_PORT%  forwarding      KEEP OFF THE INTERNET
+echo  Status       http://127.0.0.1:%LOC_PORT%/_tunnel/status
 echo.
-echo  Ports come from .env - the numbers above are the defaults.
 echo  Firewall the local port so only your own containers reach it.
 echo.
 echo  Ctrl+C to stop.
@@ -90,6 +110,21 @@ echo ===========================================================
 echo.
 "%PY%" server.py
 goto :done
+
+
+:read_env
+REM read_env <file> <key> <target-var> - last assignment wins, quotes stripped.
+REM Looping every line rather than stopping at the first match is what makes a
+REM duplicated key resolve the same way dotenv and the shell resolve it.
+if not exist %1 goto :eof
+REM %%~B already strips surrounding quotes, so no separate unquoting step is
+REM needed - the `call set` that used to do it produced malformed syntax when
+REM the value was empty, and only the missing-token path ever hit that.
+REM An empty assignment in .env means "not set", so the caller keeps its default.
+for /f "usebackq eol=# tokens=1,* delims==" %%A in (%1) do (
+  if /i "%%~A"=="%~2" if not "%%~B"=="" set "%~3=%%~B"
+)
+goto :eof
 
 
 :no_python

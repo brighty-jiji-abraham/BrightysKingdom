@@ -104,6 +104,15 @@ mkdir -p logs
 # while the same override worked when the app was started directly. Having the
 # two disagree makes overrides untrustworthy, so they now behave the same.
 if [ -f .env ]; then
+    # Snapshot the keys that were already in the environment BEFORE reading the
+    # file. Checking the live environment instead would make the first
+    # assignment of a duplicated key win, because exporting it marks the key as
+    # "already set" for the rest of the loop. That flipped .env from last-wins
+    # to first-wins: this file defines LOG_LEVEL twice, and the DEBUG at the top
+    # started beating the INFO at the bottom - which turned on pymongo's command
+    # logging and wrote the tunnel token into proxy.log in cleartext.
+    _preset_keys=" $(env | sed 's/=.*//' | tr '\n' ' ') "
+
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
             ''|'#'*) continue ;;
@@ -115,10 +124,11 @@ if [ -f .env ]; then
         case "$key" in
             ''|*[!A-Za-z0-9_]*) continue ;;
         esac
-        # Skip anything already exported, so CLI overrides survive.
-        if [ -n "$(eval "printf '%s' \"\${$key+set}\"")" ]; then
-            continue
-        fi
+        # Anything already exported wins, so CLI overrides survive. Later
+        # assignments inside the file still overwrite earlier ones.
+        case "$_preset_keys" in
+            *" $key "*) continue ;;
+        esac
         value=${line#*=}
         # Strip one layer of surrounding quotes, as dotenv does.
         case "$value" in
@@ -127,6 +137,7 @@ if [ -f .env ]; then
         esac
         export "$key=$value"
     done < .env
+    unset _preset_keys
 else
     echo "[warn] no .env found - copy .env.example to .env and edit it"
 fi

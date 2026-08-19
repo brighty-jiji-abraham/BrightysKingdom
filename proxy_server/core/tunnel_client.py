@@ -31,6 +31,7 @@ Standalone, for debugging:
 """
 
 import base64
+import collections
 import json
 import os
 import time
@@ -122,6 +123,13 @@ SKIP_WS_HEADERS = SKIP_REQUEST_HEADERS | {
 
 WS_CONNECT_TIMEOUT = float(os.getenv("TUNNEL_WS_CONNECT_TIMEOUT", "20"))
 
+#: How many recent requests to keep for the admin UI. In memory only, so it
+#: resets with the process - the durable record is the proxy log.
+REQUEST_LOG_SIZE = int(os.getenv("TUNNEL_REQUEST_LOG_SIZE", "200"))
+
+#: Minutes of traffic history to keep for the chart.
+TRAFFIC_WINDOW_MINUTES = int(os.getenv("TUNNEL_TRAFFIC_WINDOW_MINUTES", "60"))
+
 
 #: The running client, so the admin API can report on it. There is at most
 #: one per process.
@@ -156,6 +164,62 @@ class TunnelClient:
         self.requests_served = 0
         self.last_error = None
         self.started_at = time.time()
+
+        # What actually crossed the tunnel, for the admin UI. Bounded on both
+        # counts so a busy tunnel cannot grow memory without limit.
+        self.recent = collections.deque(maxlen=REQUEST_LOG_SIZE)
+        self.traffic = collections.OrderedDict()   # minute -> counters
+
+    def record(self, method, path, status, started, error=None, kind="http"):
+        """Note one completed request, for the log and the traffic chart."""
+        now = time.time()
+        elapsed_ms = int((now - started) * 1000)
+
+        self.recent.append({
+            "at": int(now),
+            "kind": kind,
+            "method": method,
+            "path": path,
+            "status": status,
+            "ms": elapsed_ms,
+            "error": error,
+        })
+
+        minute = int(now // 60) * 60
+        bucket = self.traffic.get(minute)
+        if bucket is None:
+            bucket = {"count": 0, "errors": 0, "ms": 0}
+            self.traffic[minute] = bucket
+        bucket["count"] += 1
+        bucket["ms"] += elapsed_ms
+        # A transport failure has no status code, so treat it as an error too -
+        # otherwise a tunnel that cannot reach the Kingdom looks perfectly
+        # healthy on the chart.
+        if error or (isinstance(status, int) and status >= 400):
+            bucket["errors"] += 1
+
+        cutoff = minute - TRAFFIC_WINDOW_MINUTES * 60
+        for old_minute in [m for m in self.traffic if m < cutoff]:
+            del self.traffic[old_minute]
+
+    def traffic_series(self):
+        """Per-minute counts, zero-filled across the window.
+
+        Gaps are filled deliberately: a quiet minute must read as a zero bar,
+        not as a missing one, or the chart implies traffic it never saw.
+        """
+        now_minute = int(time.time() // 60) * 60
+        series = []
+        for i in range(TRAFFIC_WINDOW_MINUTES - 1, -1, -1):
+            minute = now_minute - i * 60
+            b = self.traffic.get(minute)
+            series.append({
+                "minute": minute,
+                "count": b["count"] if b else 0,
+                "errors": b["errors"] if b else 0,
+                "avg_ms": int(b["ms"] / b["count"]) if b and b["count"] else 0,
+            })
+        return series
 
     def status(self):
         """Snapshot for the admin API."""
@@ -226,11 +290,13 @@ class TunnelClient:
         except requests.exceptions.ConnectionError as exc:
             logger.error(f"tunnel: cannot reach the Kingdom at {self.cfg['local_target']} — {exc}")
             self.send_error(req_id, f"cannot reach local Kingdom at {self.cfg['local_target']}: {exc}")
+            self.record(method, path, None, started, error="cannot reach the proxy")
             self.active -= 1
             return
         except Exception as exc:
             logger.error(f"tunnel: local request failed: {exc}")
             self.send_error(req_id, f"local request failed: {exc}")
+            self.record(method, path, None, started, error=str(exc)[:160])
             self.active -= 1
             return
 
@@ -253,6 +319,7 @@ class TunnelClient:
                     })
 
             self.send({"t": "end", "id": req_id})
+            self.record(method, path, response.status_code, started)
             logger.info(
                 f"tunnel: <- {response.status_code} {path} "
                 f"in {time.time() - started:.2f}s (id={req_id[:8]})"
@@ -260,9 +327,11 @@ class TunnelClient:
         except websocket.WebSocketException as exc:
             # Tunnel died mid-stream; the head has already failed this request.
             logger.warning(f"tunnel: lost while streaming id={req_id[:8]}: {exc}")
+            self.record(method, path, None, started, error="tunnel lost mid-stream")
         except Exception as exc:
             logger.error(f"tunnel: stream error id={req_id[:8]}: {exc}")
             self.send_error(req_id, f"stream error: {exc}")
+            self.record(method, path, None, started, error=str(exc)[:160])
         finally:
             response.close()
             self.active -= 1
@@ -312,6 +381,8 @@ class TunnelClient:
             local.settimeout(None)
         except Exception as exc:
             logger.error(f"tunnel: ws open failed for {path}: {exc}")
+            self.record("WS", path, None, time.time(), error=str(exc)[:160],
+                        kind="websocket")
             try:
                 self.send({"t": "ws_error", "id": sid, "error": str(exc)})
             except Exception:
@@ -324,6 +395,7 @@ class TunnelClient:
         # Register before announcing: the head starts pumping the instant it
         # sees ws_opened, so the session must already be reachable.
         self.send({"t": "ws_opened", "id": sid})
+        self.record("WS", path, 101, time.time(), kind="websocket")
         logger.info(f"tunnel: ws open {path} (id={sid[:8]})")
 
         gevent.spawn(self.pump_ws_up, sid, session, path)
@@ -544,6 +616,22 @@ def start_in_background():
         f"forwarding to {cfg['local_target']}"
     )
     return gevent.spawn(_active_client.run_forever)
+
+
+def get_activity(limit=100):
+    """Recent tunnel requests and the traffic series, for GET /admin/tunnel/requests."""
+    client = _active_client
+    if client is None:
+        return {"requests": [], "traffic": [], "window_minutes": TRAFFIC_WINDOW_MINUTES}
+
+    limit = max(1, min(int(limit), REQUEST_LOG_SIZE))
+    return {
+        # Newest first: the interesting request is almost always the last one.
+        "requests": list(client.recent)[-limit:][::-1],
+        "traffic": client.traffic_series(),
+        "window_minutes": TRAFFIC_WINDOW_MINUTES,
+        "capacity": REQUEST_LOG_SIZE,
+    }
 
 
 def reconnect():
