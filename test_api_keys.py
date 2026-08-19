@@ -2,11 +2,26 @@
 """
 Test script for API key authentication
 """
+import os
+import sys
+
 import requests
 import json
 
-BASE_URL = "http://localhost:2000"
-MASTER_API_KEY = "your-master-api-key-here"  # Set this to your master key
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+BASE_URL = os.getenv("PROXY_BASE_URL", "http://localhost:2000")
+
+# Read from .env rather than hardcoding. The old literal was the placeholder
+# from .env.example, so this script silently passed against an unconfigured
+# proxy and failed against a properly configured one.
+MASTER_API_KEY = os.getenv("MASTER_API_KEY", "")
+if not MASTER_API_KEY:
+    sys.exit("MASTER_API_KEY is not set - put it in .env or export it first.")
 
 def test_create_api_key():
     """Test creating a new API key"""

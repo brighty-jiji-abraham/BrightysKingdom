@@ -88,11 +88,28 @@ class HealthService:
             logger.info("Health monitoring stopped")
     
     def _monitor_loop(self):
-        """Main monitoring loop"""
+        """Main monitoring loop.
+
+        Probes once immediately, then every interval. `wait(interval)` at the
+        top of the loop meant nothing was checked for the first 30 seconds
+        after start, so every backend reported status 'unknown' with no
+        last_check - which the dashboard rendered as a row of failures on a
+        perfectly healthy system.
+        """
         interval = self.config.get('HEALTH_CHECK_INTERVAL', 30)
-        
-        while not self.stop_event.wait(interval):
+
+        try:
             self._check_all_backends()
+        except Exception as e:
+            # Never let one bad round kill the thread: if it exits, nothing is
+            # ever checked again and every backend silently stays 'unknown'.
+            logger.error(f"Initial health check failed: {e}")
+
+        while not self.stop_event.wait(interval):
+            try:
+                self._check_all_backends()
+            except Exception as e:
+                logger.error(f"Health check round failed: {e}")
     
     def _check_all_backends(self):
         """Check health of all backend instances"""

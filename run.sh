@@ -95,13 +95,38 @@ mkdir -p logs
 
 # --- .env ------------------------------------------------------------------
 # The apps load .env themselves via python-dotenv; sourcing it here as well
-# means values are visible to this script (for the token check below) and to
-# anything it spawns. `set -a` exports every assignment.
+# makes values visible to this script (for the token check below) and to
+# anything it spawns.
+#
+# Variables already set in the environment WIN over .env, matching what
+# python-dotenv does. Plain `set -a; . ./.env` does the opposite - it
+# overwrites them - so `PROXY_MONGO_URL=... ./run.sh` was silently ignored
+# while the same override worked when the app was started directly. Having the
+# two disagree makes overrides untrustworthy, so they now behave the same.
 if [ -f .env ]; then
-    set -a
-    # shellcheck disable=SC1091
-    . ./.env
-    set +a
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+        key=${line%%=*}
+        key=$(printf '%s' "$key" | tr -d '[:space:]')
+        case "$key" in
+            ''|*[!A-Za-z0-9_]*) continue ;;
+        esac
+        # Skip anything already exported, so CLI overrides survive.
+        if [ -n "$(eval "printf '%s' \"\${$key+set}\"")" ]; then
+            continue
+        fi
+        value=${line#*=}
+        # Strip one layer of surrounding quotes, as dotenv does.
+        case "$value" in
+            \"*\") value=${value#\"}; value=${value%\"} ;;
+            \'*\') value=${value#\'}; value=${value%\'} ;;
+        esac
+        export "$key=$value"
+    done < .env
 else
     echo "[warn] no .env found - copy .env.example to .env and edit it"
 fi

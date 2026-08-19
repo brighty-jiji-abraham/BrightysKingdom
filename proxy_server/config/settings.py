@@ -95,7 +95,12 @@ class Config:
     API_KEY_HEADER = os.getenv('API_KEY_HEADER', 'X-API-Key')
     API_KEY_PREFIX = os.getenv('API_KEY_PREFIX', 'pk_')
     API_KEY_LENGTH = int(os.getenv('API_KEY_LENGTH', 32))
-    MASTER_API_KEY = os.getenv('MASTER_API_KEY', 'master-api-key-12345')
+    # No default on purpose. This used to fall back to the literal
+    # 'master-api-key-12345', which is a working master credential for
+    # anyone who has read this file. Empty means no master key is
+    # registered at all and admin writes are refused - see create_app,
+    # which warns loudly when that happens.
+    MASTER_API_KEY = os.getenv('MASTER_API_KEY', '')
 
     # Security
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*')

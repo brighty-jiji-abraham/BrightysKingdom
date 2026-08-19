@@ -17,3 +17,8 @@ eventlet
 # `pip install -r requirements.txt` produces an install that cannot start.
 gevent>=24.0.0
 gevent-websocket>=0.10.1
+
+# Runtime configuration store: routes and backends live in MongoDB so they
+# survive restarts and can be managed from the admin panel. The proxy falls
+# back to .env when the database is unreachable, so this is not fatal.
+pymongo>=4.6

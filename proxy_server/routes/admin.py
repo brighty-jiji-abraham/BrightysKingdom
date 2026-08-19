@@ -4,6 +4,7 @@ Admin panel routes with API key management
 from flask import Blueprint, current_app, jsonify, request
 from proxy_server.middleware.auth import optional_auth, admin_required, api_key_manager
 from proxy_server.core.proxy import proxy_core
+from proxy_server.services import config_store
 from proxy_server.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -73,85 +74,250 @@ def get_load_balancer_stats():
 @admin_bp.route('/backends/add', methods=['POST'])
 @admin_required
 def add_backend():
-    """Add a new backend URL to a route"""
+    """Add a backend URL to a route, creating the route if it is new.
+
+    Writes to MongoDB first, then refreshes the live config from it. This
+    previously only mutated the in-memory dict, so a backend added through the
+    admin panel disappeared on the next restart with nothing to explain why.
+    """
     data = request.get_json() or {}
-    route = data.get('route')  # e.g., '/app1'
-    url = data.get('url')      # e.g., 'http://localhost:3003'
-    
+    route = (data.get('route') or '').strip()
+    url = (data.get('url') or '').strip()
+
     if not route or not url:
         return {'error': 'route and url are required'}, 400
-    
+    if not route.startswith('/'):
+        return {'error': 'route must start with /'}, 400
+    if not url.startswith(('http://', 'https://')):
+        return {'error': 'url must start with http:// or https://'}, 400
+
+    existing = current_app.config.get('BACKEND_ROUTES', {}).get(route)
+    already = url == existing if isinstance(existing, str) else url in (existing or [])
+    if already:
+        return {'error': 'Backend URL already exists on this route'}, 400
+
     try:
-        # Update in-memory configuration
-        backend_routes = current_app.config.get('BACKEND_ROUTES', {})
-        
-        if route in backend_routes:
-            current_backends = backend_routes[route]
-            if isinstance(current_backends, str):
-                # Convert single URL to list
-                backend_routes[route] = [current_backends, url]
-            elif isinstance(current_backends, list):
-                # Add to existing list
-                if url not in current_backends:
-                    backend_routes[route].append(url)
-                else:
-                    return {'error': 'Backend URL already exists'}, 400
-        else:
-            # New route
-            backend_routes[route] = url
-        
-        # Reinitialize health monitoring for new backend
-        if hasattr(current_app, 'health_service'):
-            current_app.health_service._initialize_backend_status()
-        
-        return {'message': f'Backend {url} added to route {route}', 'current_backends': backend_routes[route]}, 200
-        
+        config_store.add_backend(
+            route, url,
+            name=data.get('name'),
+            health_route=data.get('health_route'),
+        )
+        config_store.refresh_app(current_app._get_current_object())
+    except config_store.ConfigStoreUnavailable as e:
+        # Refusing beats a silent in-memory-only write: the caller would
+        # otherwise believe the change was durable.
+        logger.error(f"add_backend: config store unavailable: {e}")
+        return {
+            'error': 'Configuration database unavailable',
+            'detail': str(e),
+            'hint': 'Backends are stored in MongoDB - check PROXY_MONGO_URL',
+        }, 503
     except Exception as e:
-        logger.error(f"Error adding backend: {str(e)}")
-        return {'error': 'Failed to add backend'}, 500
+        logger.error(f"Error adding backend: {e}")
+        return {'error': 'Failed to add backend', 'detail': str(e)}, 500
+
+    return {
+        'message': f'Backend {url} added to route {route}',
+        'current_backends': current_app.config['BACKEND_ROUTES'].get(route),
+        'persisted': True,
+    }, 200
+
 
 @admin_bp.route('/backends/remove', methods=['POST'])
 @admin_required
 def remove_backend():
-    """Remove a backend URL from a route"""
+    """Remove a backend URL. The route is dropped once its last URL goes."""
     data = request.get_json() or {}
-    route = data.get('route')
-    url = data.get('url')
-    
+    route = (data.get('route') or '').strip()
+    url = (data.get('url') or '').strip()
+
     if not route or not url:
         return {'error': 'route and url are required'}, 400
-    
-    try:
-        backend_routes = current_app.config.get('BACKEND_ROUTES', {})
-        
-        if route not in backend_routes:
-            return {'error': 'Route not found'}, 404
-        
-        current_backends = backend_routes[route]
-        
-        if isinstance(current_backends, list) and url in current_backends:
-            current_backends.remove(url)
-            if len(current_backends) == 1:
-                # Convert back to single URL
-                backend_routes[route] = current_backends[0]
-            elif len(current_backends) == 0:
-                # Remove route entirely
-                del backend_routes[route]
-            
-            # Reinitialize health monitoring
-            if hasattr(current_app, 'health_service'):
-                current_app.health_service._initialize_backend_status()
-            
-            return {'message': f'Backend {url} removed from route {route}', 'current_backends': backend_routes.get(route, [])}, 200
-        elif isinstance(current_backends, str) and current_backends == url:
-            del backend_routes[route]
-            return {'message': f'Route {route} removed entirely'}, 200
-        
+
+    backend_routes = current_app.config.get('BACKEND_ROUTES', {})
+    if route not in backend_routes:
+        return {'error': 'Route not found'}, 404
+
+    current = backend_routes[route]
+    known = [current] if isinstance(current, str) else list(current or [])
+    if url not in known:
         return {'error': 'Backend URL not found in route'}, 404
-        
+
+    try:
+        config_store.remove_backend(route, url)
+        config_store.refresh_app(current_app._get_current_object())
+    except config_store.ConfigStoreUnavailable as e:
+        logger.error(f"remove_backend: config store unavailable: {e}")
+        return {'error': 'Configuration database unavailable', 'detail': str(e)}, 503
     except Exception as e:
-        logger.error(f"Error removing backend: {str(e)}")
-        return {'error': 'Failed to remove backend'}, 500
+        logger.error(f"Error removing backend: {e}")
+        return {'error': 'Failed to remove backend', 'detail': str(e)}, 500
+
+    remaining = current_app.config['BACKEND_ROUTES'].get(route)
+    return {
+        'message': (
+            f'Backend {url} removed from route {route}' if remaining
+            else f'Route {route} removed entirely - it had no backends left'
+        ),
+        'current_backends': remaining or [],
+        'persisted': True,
+    }, 200
+
+
+@admin_bp.route('/backends/route', methods=['POST'])
+@admin_required
+def upsert_route():
+    """Create or update a whole route: display name, health path, URL list."""
+    data = request.get_json() or {}
+    route = (data.get('route') or '').strip()
+
+    if not route or not route.startswith('/'):
+        return {'error': 'route is required and must start with /'}, 400
+
+    urls = data.get('urls')
+    if urls is not None:
+        if not isinstance(urls, list):
+            return {'error': 'urls must be a list'}, 400
+        urls = [u.strip() for u in urls if u and u.strip()]
+        bad = [u for u in urls if not u.startswith(('http://', 'https://'))]
+        if bad:
+            return {'error': 'invalid url(s): ' + ', '.join(bad)}, 400
+
+    try:
+        config_store.upsert_route(
+            route,
+            name=data.get('name'),
+            health_route=data.get('health_route'),
+            urls=urls,
+        )
+        config_store.refresh_app(current_app._get_current_object())
+    except config_store.ConfigStoreUnavailable as e:
+        return {'error': 'Configuration database unavailable', 'detail': str(e)}, 503
+    except Exception as e:
+        logger.error(f"Error upserting route: {e}")
+        return {'error': 'Failed to save route', 'detail': str(e)}, 500
+
+    return {
+        'message': f'Route {route} saved',
+        'current_backends': current_app.config['BACKEND_ROUTES'].get(route),
+        'persisted': True,
+    }, 200
+
+
+@admin_bp.route('/backends/route/delete', methods=['POST'])
+@admin_required
+def delete_route():
+    """Delete an entire route and all of its backends."""
+    data = request.get_json() or {}
+    route = (data.get('route') or '').strip()
+    if not route:
+        return {'error': 'route is required'}, 400
+
+    try:
+        config_store.remove_route(route)
+        config_store.refresh_app(current_app._get_current_object())
+    except config_store.ConfigStoreUnavailable as e:
+        return {'error': 'Configuration database unavailable', 'detail': str(e)}, 503
+    except Exception as e:
+        logger.error(f"Error deleting route: {e}")
+        return {'error': 'Failed to delete route', 'detail': str(e)}, 500
+
+    return {'message': f'Route {route} deleted', 'persisted': True}, 200
+
+
+@admin_bp.route('/backends/update', methods=['POST'])
+@admin_required
+def update_backend():
+    """Change one backend URL in place, keeping its position on the route.
+
+    Editing via remove-then-add would move the backend to the end of the list,
+    quietly changing round-robin order, and would leave the route one backend
+    short in between.
+    """
+    data = request.get_json() or {}
+    route = (data.get('route') or '').strip()
+    old_url = (data.get('url') or '').strip()
+    new_url = (data.get('new_url') or '').strip()
+
+    if not route or not old_url or not new_url:
+        return {'error': 'route, url and new_url are required'}, 400
+    if not new_url.startswith(('http://', 'https://')):
+        return {'error': 'new_url must start with http:// or https://'}, 400
+    if old_url == new_url:
+        return {'error': 'new_url is the same as the current url'}, 400
+
+    try:
+        updated = config_store.update_backend_url(route, old_url, new_url)
+        if updated is None:
+            return {'error': f'{old_url} is not a backend of {route}'}, 404
+        config_store.refresh_app(current_app._get_current_object())
+    except config_store.DuplicateBackend as e:
+        return {'error': str(e)}, 400
+    except config_store.ConfigStoreUnavailable as e:
+        logger.error(f"update_backend: config store unavailable: {e}")
+        return {'error': 'Configuration database unavailable', 'detail': str(e)}, 503
+    except Exception as e:
+        logger.error(f"Error updating backend: {e}")
+        return {'error': 'Failed to update backend', 'detail': str(e)}, 500
+
+    return {
+        'message': f'{old_url} changed to {new_url} on {route}',
+        'current_backends': current_app.config['BACKEND_ROUTES'].get(route),
+        'persisted': True,
+    }, 200
+
+
+@admin_bp.route('/backends/route/enabled', methods=['POST'])
+@admin_required
+def set_route_enabled():
+    """Take a route in or out of rotation without losing its configuration."""
+    data = request.get_json() or {}
+    route = (data.get('route') or '').strip()
+    if not route:
+        return {'error': 'route is required'}, 400
+    if 'enabled' not in data:
+        return {'error': 'enabled is required'}, 400
+
+    enabled = bool(data.get('enabled'))
+    try:
+        config_store.set_enabled(route, enabled)
+        config_store.refresh_app(current_app._get_current_object())
+    except config_store.ConfigStoreUnavailable as e:
+        return {'error': 'Configuration database unavailable', 'detail': str(e)}, 503
+    except Exception as e:
+        logger.error(f"Error toggling route: {e}")
+        return {'error': 'Failed to update route', 'detail': str(e)}, 500
+
+    return {
+        'message': f'Route {route} {"enabled" if enabled else "disabled"}',
+        'enabled': enabled,
+        'persisted': True,
+    }, 200
+
+
+@admin_bp.route('/backends/store', methods=['GET'])
+def list_store_routes():
+    """Raw store documents, including disabled routes.
+
+    /admin/backends reports live health and therefore only knows about routes
+    the proxy is serving. The panel also has to show a disabled route in order
+    to offer re-enabling it, which is why this exists alongside it.
+    """
+    try:
+        return jsonify({'routes': config_store.list_routes(include_disabled=True),
+                        'source': config_store.describe()})
+    except config_store.ConfigStoreUnavailable as e:
+        return {'error': 'Configuration database unavailable', 'detail': str(e)}, 503
+    except Exception as e:
+        logger.error(f"Error listing store routes: {e}")
+        return {'error': 'Failed to list routes', 'detail': str(e)}, 500
+
+
+@admin_bp.route('/config/source', methods=['GET'])
+def config_source():
+    """Whether routes came from MongoDB or from .env, and why."""
+    return jsonify(config_store.describe())
+
 
 @admin_bp.route('/config')
 @admin_required

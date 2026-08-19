@@ -81,9 +81,28 @@ def create_app(config_class=Config):
     # Initialize API key manager
     api_key_manager.initialize_with_app(app)
 
+    # An unset master key is fail-closed, not fail-open: no master key is
+    # registered, so every admin write endpoint refuses. Say so at boot rather
+    # than letting it surface later as a confusing 403 from the management UI.
+    if not app.config.get('MASTER_API_KEY'):
+        logger.warning('=' * 60)
+        logger.warning('MASTER_API_KEY is not set.')
+        logger.warning('Admin write endpoints and the management UI login will')
+        logger.warning('be refused until it is. Generate one with:')
+        logger.warning('    python -c "import secrets; print(secrets.token_urlsafe(32))"')
+        logger.warning('then put it in .env as MASTER_API_KEY=...')
+        logger.warning('=' * 60)
+
     # Register blueprints
     app.register_blueprint(proxy_bp)
     app.register_blueprint(admin_bp, url_prefix='/admin')
+
+    # Load routes and backends from MongoDB, seeding it from .env on first run.
+    # Must happen BEFORE HealthService is constructed: it snapshots
+    # BACKEND_ROUTES to build its status table, so a later swap would leave it
+    # monitoring the .env set instead of the database one.
+    from proxy_server.services import config_store
+    config_store.apply_to_app(app)
 
     # Initialize services
     monitoring_service = MonitoringService()

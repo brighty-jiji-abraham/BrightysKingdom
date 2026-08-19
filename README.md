@@ -217,6 +217,17 @@ private machine behind the tunnel, and several defaults assume that.
   proxy directly, put an IP allowlist in front of `/ollama` — an open Ollama
   lets anyone generate on your GPU, pull models until the disk fills, or delete
   them.
+- **Set `MASTER_API_KEY` to something you generated.** It unlocks every admin
+  write endpoint and is the management UI login. `.env.example` ships it empty
+  on purpose — a placeholder there becomes a working, publicly known credential
+  the moment someone copies the file and forgets. Leaving it unset is
+  fail-closed: no master key is registered, admin writes are refused, and the
+  proxy warns loudly at boot.
+
+  ```bash
+  python -c "import secrets; print(secrets.token_urlsafe(32))"
+  ```
+
 - **API keys live in memory only.** They are lost on restart; only
   `MASTER_API_KEY` is restored from config. Keys created through
   `/admin/api-keys` do not survive a restart and are not shared across
