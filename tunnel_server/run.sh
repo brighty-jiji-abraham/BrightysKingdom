@@ -88,8 +88,36 @@ case "$MODE" in
                 [ -x "$PY" ] || PY="./venv/Scripts/python.exe"
                 ;;
         esac
-        "$PY" -m pip install --upgrade pip
-        "$PY" -m pip install -r requirements.txt
+
+        # An existing venv directory is not proof of a working one. Debian and
+        # Ubuntu strip ensurepip out of the stdlib and ship it in python3-venv,
+        # so `python3 -m venv` there can leave a venv behind with no pip in it.
+        # That used to surface only at the install step, as a bare
+        # "No module named pip" that said nothing about the cause.
+        if ! "$PY" -m pip --version >/dev/null 2>&1; then
+            echo "[setup] this venv has no pip - repairing with ensurepip"
+            if ! "$PY" -m ensurepip --upgrade >/dev/null 2>&1; then
+                echo "[setup] ensurepip unavailable, rebuilding the venv from scratch"
+                rm -rf venv
+                "${PYTHON:-python3}" -m venv venv >/dev/null 2>&1 || true
+                PY="./venv/bin/python"
+                [ -x "$PY" ] || PY="./venv/Scripts/python.exe"
+            fi
+        fi
+
+        if [ ! -x "$PY" ] || ! "$PY" -m pip --version >/dev/null 2>&1; then
+            echo "[ERROR] Could not get a working venv with pip." >&2
+            echo "        Debian and Ubuntu ship venv and pip separately:" >&2
+            echo >&2
+            echo "            sudo apt install -y python3-venv python3-pip" >&2
+            echo >&2
+            echo "        Then remove the broken venv and try again:" >&2
+            echo "            rm -rf venv && ./run.sh setup" >&2
+            exit 1
+        fi
+
+        "$PY" -m pip install --upgrade pip || exit 1
+        "$PY" -m pip install -r requirements.txt || exit 1
         echo
         echo "[setup] done. Next:"
         echo "    cp .env.example .env"

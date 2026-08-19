@@ -14,3 +14,6 @@ tunnel_server/venv/
 # (it predates this file), so listing it here would not untrack it — see
 # `git rm --cached .env` if you want it out.
 tunnel_server/.env
+
+# Timestamped .env backups taken before edits
+.env.backup-*
