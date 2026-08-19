@@ -65,6 +65,22 @@ MONGO_URL = os.getenv(
 MONGO_DB = os.getenv("PROXY_MONGO_DB", "")          # else taken from the URL
 COLLECTION = os.getenv("PROXY_MONGO_COLLECTION", "backends")
 
+#: Everything that is not a route lives here, one document per section.
+#: Kept apart from `backends` so a route listing stays a route listing.
+SETTINGS_COLLECTION = os.getenv("PROXY_MONGO_SETTINGS_COLLECTION", "settings")
+
+#: Tunnel fields held in the database, with the env var each is seeded from.
+#: TUNNEL_TOKEN is among them by request. It is a credential rather than
+#: topology, so anyone with read access to this database can impersonate the
+#: GPU box - keep the database access-controlled, or set the token in .env
+#: instead, which still wins over whatever is stored here.
+TUNNEL_FIELDS = {
+    "server_url": "TUNNEL_SERVER_URL",
+    "token": "TUNNEL_TOKEN",
+    "client_name": "TUNNEL_CLIENT_NAME",
+    "local_target": "TUNNEL_LOCAL_TARGET",
+}
+
 # Short on purpose. This runs during create_app, so a dead or firewalled Mongo
 # must fail fast rather than stall startup for the driver's 30s default.
 CONNECT_TIMEOUT_MS = int(os.getenv("PROXY_MONGO_TIMEOUT_MS", "3000"))
@@ -79,7 +95,7 @@ class ConfigStoreUnavailable(RuntimeError):
     """Mongo could not be reached. Callers fall back to .env."""
 
 
-def _collection():
+def _database():
     """Connect lazily and reuse the client. Raises ConfigStoreUnavailable."""
     global _client
 
@@ -106,7 +122,15 @@ def _collection():
         raise ConfigStoreUnavailable(
             "no database in PROXY_MONGO_URL and PROXY_MONGO_DB is unset"
         )
-    return db[COLLECTION]
+    return db
+
+
+def _collection():
+    return _database()[COLLECTION]
+
+
+def _settings():
+    return _database()[SETTINGS_COLLECTION]
 
 
 def is_available():
@@ -345,6 +369,98 @@ def seed_from_config(backend_routes, names, health_routes):
         col.insert_many(docs)
         col.create_index("route", unique=True)
     return len(docs)
+
+
+# ---------------------------------------------------------------------------
+# Tunnel settings
+# ---------------------------------------------------------------------------
+
+def _tunnel_from_env():
+    return {field: os.getenv(env, "") for field, env in TUNNEL_FIELDS.items()}
+
+
+def load_tunnel():
+    """Tunnel settings, database first and .env as the fallback.
+
+    Matches how routes behave: the database is the source of truth once it
+    holds anything, and .env keeps the tunnel dialling when Mongo is down -
+    a config-store outage must not silently unpublish this machine.
+
+    Never raises. Returns (settings, source).
+    """
+    env = _tunnel_from_env()
+    try:
+        doc = _settings().find_one({"_id": "tunnel"})
+    except (ConfigStoreUnavailable, PyMongoError) as exc:
+        logger.warning(f"config store: tunnel settings unavailable ({exc}) - using .env")
+        return env, "env"
+
+    if not doc:
+        return env, "env"
+
+    merged = {}
+    for field in TUNNEL_FIELDS:
+        value = (doc.get(field) or "").strip()
+        # An empty field in the database means "not set here", so .env still
+        # answers for it. That keeps a half-filled document from blanking a
+        # working configuration.
+        merged[field] = value or env[field]
+    return merged, "database"
+
+
+def save_tunnel(**fields):
+    """Write tunnel settings. Only recognised fields are stored."""
+    changes = {
+        k: (v or "").strip()
+        for k, v in fields.items()
+        if k in TUNNEL_FIELDS and v is not None
+    }
+    if not changes:
+        return load_tunnel()[0]
+
+    changes["updated_at"] = _now()
+    _settings().update_one({"_id": "tunnel"}, {"$set": changes}, upsert=True)
+    return load_tunnel()[0]
+
+
+def seed_tunnel_from_env():
+    """Copy .env tunnel values into an empty settings document, once.
+
+    Only runs when no tunnel document exists, so it never overwrites something
+    set through the admin panel.
+    """
+    col = _settings()
+    if col.find_one({"_id": "tunnel"}):
+        return False
+
+    env = _tunnel_from_env()
+    if not any(env.values()):
+        return False
+
+    col.update_one(
+        {"_id": "tunnel"},
+        {"$set": dict(env, updated_at=_now())},
+        upsert=True,
+    )
+    return True
+
+
+def describe_tunnel():
+    """Tunnel settings for the admin API, with the token withheld.
+
+    The token is returned only as a flag. It is a credential, and echoing it
+    back on every poll of the settings endpoint would spread it further than
+    it needs to go.
+    """
+    settings, source = load_tunnel()
+    return {
+        "source": source,
+        "server_url": settings["server_url"],
+        "client_name": settings["client_name"],
+        "local_target": settings["local_target"],
+        "token_set": bool(settings["token"]),
+        "token_from_env": bool(os.getenv("TUNNEL_TOKEN", "")),
+    }
 
 
 def apply_to_app(app):

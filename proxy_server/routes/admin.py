@@ -442,6 +442,75 @@ def websocket_sessions():
         return {'status': 'error', 'error': str(e)}, 500
 
 
+@admin_bp.route('/tunnel/config', methods=['GET'])
+@admin_required
+def get_tunnel_config():
+    """Tunnel settings as stored, with the token withheld.
+
+    Master-key gated even though it is a read: it reports where this machine
+    publishes itself, and whether a credential is present.
+    """
+    try:
+        return jsonify({'status': 'success', 'data': config_store.describe_tunnel()})
+    except Exception as e:
+        logger.error(f"tunnel config read failed: {e}")
+        return {'error': 'Failed to read tunnel settings', 'detail': str(e)}, 500
+
+
+@admin_bp.route('/tunnel/config', methods=['POST'])
+@admin_required
+def set_tunnel_config():
+    """Write tunnel settings, then re-dial so they take effect immediately.
+
+    Fields left out are untouched. Sending an empty string clears a field, so
+    the .env value takes over again - that is how you hand the token back to
+    the host without deleting the document.
+    """
+    data = request.get_json() or {}
+
+    url = data.get('server_url')
+    if url is not None and url.strip() and not url.strip().startswith(('ws://', 'wss://')):
+        return {'error': 'server_url must start with ws:// or wss://'}, 400
+
+    target = data.get('local_target')
+    if target is not None and target.strip() and not target.strip().startswith(('http://', 'https://')):
+        return {'error': 'local_target must start with http:// or https://'}, 400
+
+    try:
+        config_store.save_tunnel(
+            server_url=url,
+            token=data.get('token'),
+            client_name=data.get('client_name'),
+            local_target=target,
+        )
+    except config_store.ConfigStoreUnavailable as e:
+        logger.error(f"tunnel config write failed: {e}")
+        return {
+            'error': 'Configuration database unavailable',
+            'detail': str(e),
+            'hint': 'Tunnel settings are stored in MongoDB - check PROXY_MONGO_URL',
+        }, 503
+    except Exception as e:
+        logger.error(f"tunnel config write failed: {e}")
+        return {'error': 'Failed to save tunnel settings', 'detail': str(e)}, 500
+
+    # Closing the socket is enough: run_forever re-resolves settings on every
+    # pass, so the next reconnect uses the new values.
+    redialled = False
+    try:
+        from proxy_server.core.tunnel_client import reconnect
+
+        redialled = reconnect()
+    except Exception as e:
+        logger.warning(f"tunnel re-dial failed: {e}")
+
+    return {
+        'message': 'Tunnel settings saved',
+        'reconnecting': redialled,
+        'data': config_store.describe_tunnel(),
+    }, 200
+
+
 @admin_bp.route('/tunnel', methods=['GET'])
 def tunnel_status():
     """Outbound tunnel state, as seen from this side.

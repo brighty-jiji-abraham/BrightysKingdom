@@ -54,13 +54,51 @@ load_dotenv()
 
 # --- configuration ----------------------------------------------------------
 
-TUNNEL_SERVER_URL = os.getenv("TUNNEL_SERVER_URL", "")
-TUNNEL_TOKEN = os.getenv("TUNNEL_TOKEN", "")
-CLIENT_NAME = os.getenv("TUNNEL_CLIENT_NAME", "")
+# These are the .env values only. They seed the database on first run and are
+# the fallback when it is unreachable - resolve_config() below is what the
+# client actually uses, and it re-reads on every reconnect so a change made in
+# the admin panel takes effect without restarting the proxy.
+ENV_SERVER_URL = os.getenv("TUNNEL_SERVER_URL", "")
+ENV_TOKEN = os.getenv("TUNNEL_TOKEN", "")
+ENV_CLIENT_NAME = os.getenv("TUNNEL_CLIENT_NAME", "")
+ENV_LOCAL_TARGET = os.getenv("TUNNEL_LOCAL_TARGET", "http://127.0.0.1:2000")
 
-# Where the Kingdom itself is listening. Requests off the tunnel are replayed
-# here, so this must match the port run_gevent.py binds.
-LOCAL_TARGET = os.getenv("TUNNEL_LOCAL_TARGET", "http://127.0.0.1:2000").rstrip("/")
+DEFAULT_LOCAL_TARGET = "http://127.0.0.1:2000"
+
+
+def resolve_config():
+    """Current tunnel settings: database first, .env as fallback.
+
+    Reading through the config store rather than module constants is what
+    lets the endpoint be changed from the admin panel. Falls back to .env
+    whenever Mongo is unreachable, so a config-store outage cannot silently
+    unpublish this machine.
+    """
+    try:
+        from proxy_server.services import config_store
+
+        settings, source = config_store.load_tunnel()
+    except Exception as exc:                      # pragma: no cover
+        logger.warning(f"tunnel: could not read settings ({exc}) - using .env")
+        settings, source = {
+            "server_url": ENV_SERVER_URL,
+            "token": ENV_TOKEN,
+            "client_name": ENV_CLIENT_NAME,
+            "local_target": ENV_LOCAL_TARGET,
+        }, "env"
+
+    target = (settings.get("local_target") or DEFAULT_LOCAL_TARGET).rstrip("/")
+    return {
+        "server_url": settings.get("server_url") or "",
+        "token": settings.get("token") or "",
+        "client_name": settings.get("client_name") or "",
+        "local_target": target,
+        # ws:// form, for replaying tunnelled WebSockets.
+        "local_ws_target": target.replace("https://", "wss://", 1).replace(
+            "http://", "ws://", 1
+        ),
+        "source": source,
+    }
 
 CONNECT_TIMEOUT = float(os.getenv("TUNNEL_CONNECT_TIMEOUT", "10"))
 # Long enough for an Ollama /api/pull or a slow generation.
@@ -84,9 +122,6 @@ SKIP_WS_HEADERS = SKIP_REQUEST_HEADERS | {
 
 WS_CONNECT_TIMEOUT = float(os.getenv("TUNNEL_WS_CONNECT_TIMEOUT", "20"))
 
-#: ws:// form of LOCAL_TARGET — where tunnelled WebSockets are replayed.
-LOCAL_WS_TARGET = LOCAL_TARGET.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
-
 
 #: The running client, so the admin API can report on it. There is at most
 #: one per process.
@@ -109,6 +144,12 @@ class TunnelClient:
         # are bound to a private port on the public server, firewalled from
         # the browser. This side of the tunnel knows just as much about its
         # own health, so it reports from here instead.
+        #
+        # cfg is a snapshot of the settings this connection is using. It is
+        # refreshed at the top of every reconnect, so an edit made in the
+        # admin panel is picked up by closing the socket rather than by
+        # restarting the process.
+        self.cfg = resolve_config()
         self.connected = False
         self.connected_at = None
         self.reconnects = 0
@@ -119,11 +160,12 @@ class TunnelClient:
     def status(self):
         """Snapshot for the admin API."""
         return {
-            "configured": bool(TUNNEL_SERVER_URL),
+            "configured": bool(self.cfg["server_url"]),
             "connected": self.connected,
-            "server_url": TUNNEL_SERVER_URL,
-            "local_target": LOCAL_TARGET,
-            "client_name": CLIENT_NAME or os.getenv("COMPUTERNAME") or "kingdom",
+            "server_url": self.cfg["server_url"],
+            "local_target": self.cfg["local_target"],
+            "client_name": self.client_name(),
+            "config_source": self.cfg["source"],
             "connected_at": int(self.connected_at) if self.connected_at else None,
             "connected_seconds": (
                 int(time.time() - self.connected_at) if self.connected_at else 0
@@ -162,7 +204,7 @@ class TunnelClient:
         }
         body = base64.b64decode(frame.get("body") or "")
 
-        url = f"{LOCAL_TARGET}{path}"
+        url = f"{self.cfg['local_target']}{path}"
         if query:
             url = f"{url}?{query}"
 
@@ -182,8 +224,8 @@ class TunnelClient:
                 allow_redirects=False,
             )
         except requests.exceptions.ConnectionError as exc:
-            logger.error(f"tunnel: cannot reach the Kingdom at {LOCAL_TARGET} — {exc}")
-            self.send_error(req_id, f"cannot reach local Kingdom at {LOCAL_TARGET}: {exc}")
+            logger.error(f"tunnel: cannot reach the Kingdom at {self.cfg['local_target']} — {exc}")
+            self.send_error(req_id, f"cannot reach local Kingdom at {self.cfg['local_target']}: {exc}")
             self.active -= 1
             return
         except Exception as exc:
@@ -252,7 +294,7 @@ class TunnelClient:
         }
         protocols = frame.get("protocols") or None
 
-        url = f"{LOCAL_WS_TARGET}{path}"
+        url = f"{self.cfg['local_ws_target']}{path}"
         if query:
             url = f"{url}?{query}"
 
@@ -371,10 +413,16 @@ class TunnelClient:
 
     # -- websocket callbacks -----------------------------------------------
 
+    def client_name(self):
+        return self.cfg["client_name"] or os.getenv("COMPUTERNAME") or "kingdom"
+
     def on_open(self, ws):
-        name = CLIENT_NAME or os.getenv("COMPUTERNAME") or "kingdom"
-        logger.info(f"tunnel: connected to {TUNNEL_SERVER_URL}, authenticating as '{name}'")
-        self.send({"t": "hello", "token": TUNNEL_TOKEN, "name": name})
+        name = self.client_name()
+        logger.info(
+            f"tunnel: connected to {self.cfg['server_url']} "
+            f"(settings from {self.cfg['source']}), authenticating as '{name}'"
+        )
+        self.send({"t": "hello", "token": self.cfg["token"], "name": name})
 
     def on_message(self, ws, message):
         try:
@@ -426,8 +474,18 @@ class TunnelClient:
     def run_forever(self):
         backoff = RECONNECT_MIN
         while True:
+            # Re-read before each attempt: this is what makes an endpoint or
+            # token changed in the admin panel take effect on the next
+            # reconnect instead of needing a process restart.
+            self.cfg = resolve_config()
+
+            if not self.cfg["server_url"]:
+                logger.info("tunnel: no server URL configured - idling")
+                gevent.sleep(15)
+                continue
+
             self.ws = websocket.WebSocketApp(
-                TUNNEL_SERVER_URL,
+                self.cfg["server_url"],
                 on_open=self.on_open,
                 on_message=self.on_message,
                 on_error=self.on_error,
@@ -458,18 +516,51 @@ def start_in_background():
     Returns the greenlet, or None when the tunnel is not configured — an
     unconfigured tunnel is a normal local-only run, not an error.
     """
-    if not TUNNEL_SERVER_URL:
-        logger.info("tunnel: TUNNEL_SERVER_URL not set — running local-only")
-        return None
-
-    if not TUNNEL_TOKEN:
-        logger.error("tunnel: TUNNEL_SERVER_URL is set but TUNNEL_TOKEN is empty — not starting")
-        return None
-
     global _active_client
+
+    # Seed the database from .env the first time, so an existing deployment
+    # keeps working and there is no migration step to forget.
+    try:
+        from proxy_server.services import config_store
+
+        if config_store.seed_tunnel_from_env():
+            logger.info("tunnel: seeded settings from .env into the config store")
+    except Exception as exc:
+        logger.warning(f"tunnel: could not seed settings ({exc})")
+
+    cfg = resolve_config()
+
+    if not cfg["server_url"]:
+        logger.info("tunnel: no server URL configured — running local-only")
+        return None
+
+    if not cfg["token"]:
+        logger.error("tunnel: a server URL is set but the token is empty — not starting")
+        return None
+
     _active_client = TunnelClient()
-    logger.info(f"tunnel: dialling {TUNNEL_SERVER_URL}, forwarding to {LOCAL_TARGET}")
+    logger.info(
+        f"tunnel: dialling {cfg['server_url']} (settings from {cfg['source']}), "
+        f"forwarding to {cfg['local_target']}"
+    )
     return gevent.spawn(_active_client.run_forever)
+
+
+def reconnect():
+    """Drop the current socket so the loop re-reads settings and re-dials.
+
+    Called after the admin panel changes tunnel settings. Closing is enough:
+    run_forever already reconnects, and it now resolves configuration afresh
+    on each pass.
+    """
+    client = _active_client
+    if client is None or client.ws is None:
+        return False
+    try:
+        client.ws.close()
+        return True
+    except Exception:
+        return False
 
 
 def get_status():
@@ -480,19 +571,21 @@ def get_status():
     missing payload.
     """
     if _active_client is None:
+        cfg = resolve_config()
         return {
-            "configured": bool(TUNNEL_SERVER_URL),
+            "configured": bool(cfg["server_url"]),
             "connected": False,
-            "server_url": TUNNEL_SERVER_URL,
-            "local_target": LOCAL_TARGET,
-            "client_name": CLIENT_NAME or os.getenv("COMPUTERNAME") or "kingdom",
+            "server_url": cfg["server_url"],
+            "local_target": cfg["local_target"],
+            "client_name": cfg["client_name"] or os.getenv("COMPUTERNAME") or "kingdom",
+            "config_source": cfg["source"],
             "connected_at": None,
             "connected_seconds": 0,
             "reconnects": 0,
             "requests_served": 0,
             "requests_in_flight": 0,
             "websocket_sessions": 0,
-            "last_error": None if TUNNEL_SERVER_URL else "TUNNEL_SERVER_URL is not set",
+            "last_error": None if cfg["server_url"] else "no tunnel server URL configured",
         }
     return _active_client.status()
 
@@ -506,7 +599,11 @@ if __name__ == "__main__":
 
     setup_logger()
 
-    if not TUNNEL_SERVER_URL or not TUNNEL_TOKEN:
-        raise SystemExit("set TUNNEL_SERVER_URL and TUNNEL_TOKEN first")
+    _cfg = resolve_config()
+    if not _cfg["server_url"] or not _cfg["token"]:
+        raise SystemExit(
+            "no tunnel settings found - set them in the admin panel, or put "
+            "TUNNEL_SERVER_URL and TUNNEL_TOKEN in .env"
+        )
 
     TunnelClient().run_forever()

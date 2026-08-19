@@ -71,6 +71,22 @@ const common = {
   },
 };
 
+/**
+ * Pass through only variables that actually have a value.
+ *
+ * `FOO: process.env.FOO || ''` sets FOO to an empty string in the child, and
+ * python-dotenv (override=False) then treats it as already set and skips the
+ * value in .env. Omitting the key is what lets .env answer for it.
+ */
+function passThrough(names) {
+  const out = {};
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && value !== '') out[name] = value;
+  }
+  return out;
+}
+
 module.exports = {
   apps: [
     {
@@ -81,19 +97,18 @@ module.exports = {
       error_file: 'logs/tunnel-head.err.log',
       env: {
         ...common.env,
-        TUNNEL_TOKEN: process.env.TUNNEL_TOKEN || '',
-        // Faces the internet — this is the token-authenticated agent endpoint.
-        TUNNEL_PUBLIC_PORT: process.env.TUNNEL_PUBLIC_PORT || '9000',
-        TUNNEL_PUBLIC_BIND: process.env.TUNNEL_PUBLIC_BIND || '0.0.0.0',
-        // The forwarding surface. Unauthenticated by design, so firewall this
-        // port to your container network. 0.0.0.0 is required for Docker
-        // containers to reach it via host.docker.internal.
-        TUNNEL_LOCAL_PORT: process.env.TUNNEL_LOCAL_PORT || '9001',
-        TUNNEL_LOCAL_BIND: process.env.TUNNEL_LOCAL_BIND || '0.0.0.0',
-        // A cold 14B model load measured ~20s to first token; keep headroom.
-        TUNNEL_FIRST_BYTE_TIMEOUT: process.env.TUNNEL_FIRST_BYTE_TIMEOUT || '120',
-        TUNNEL_IDLE_TIMEOUT: process.env.TUNNEL_IDLE_TIMEOUT || '300',
-        TUNNEL_WS_OPEN_TIMEOUT: process.env.TUNNEL_WS_OPEN_TIMEOUT || '30',
+        // Omitted rather than defaulted to '' so .env can answer - see
+        // passThrough above.
+        ...passThrough([
+          'TUNNEL_TOKEN',
+          'TUNNEL_PUBLIC_PORT',
+          'TUNNEL_PUBLIC_BIND',
+          'TUNNEL_LOCAL_PORT',
+          'TUNNEL_LOCAL_BIND',
+          'TUNNEL_FIRST_BYTE_TIMEOUT',
+          'TUNNEL_IDLE_TIMEOUT',
+          'TUNNEL_WS_OPEN_TIMEOUT',
+        ]),
       },
     },
     {
@@ -104,13 +119,17 @@ module.exports = {
       error_file: 'logs/kingdom.err.log',
       env: {
         ...common.env,
-        // Leave TUNNEL_SERVER_URL empty for a local-only run; the tunnel
-        // client then does not start at all.
-        TUNNEL_SERVER_URL: process.env.TUNNEL_SERVER_URL || '',
-        TUNNEL_TOKEN: process.env.TUNNEL_TOKEN || '',
-        TUNNEL_CLIENT_NAME: process.env.TUNNEL_CLIENT_NAME || '',
-        TUNNEL_LOCAL_TARGET:
-          process.env.TUNNEL_LOCAL_TARGET || 'http://127.0.0.1:2000',
+        // Tunnel settings live in MongoDB now; .env only seeds them and acts
+        // as the fallback. Nothing is defaulted to '' here, because an empty
+        // value would shadow both.
+        ...passThrough([
+          'TUNNEL_SERVER_URL',
+          'TUNNEL_TOKEN',
+          'TUNNEL_CLIENT_NAME',
+          'TUNNEL_LOCAL_TARGET',
+          'PROXY_MONGO_URL',
+          'PROXY_MONGO_DB',
+        ]),
       },
     },
   ],

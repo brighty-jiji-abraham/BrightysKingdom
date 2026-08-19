@@ -59,6 +59,22 @@ if (!process.env.TUNNEL_TOKEN && !fs.existsSync(path.join(__dirname, '.env'))) {
   );
 }
 
+/**
+ * Pass through only variables that actually have a value.
+ *
+ * `FOO: process.env.FOO || ''` sets FOO to an empty string in the child, and
+ * python-dotenv (override=False) then treats it as already set and skips the
+ * value in .env. Omitting the key is what lets .env answer for it.
+ */
+function passThrough(names) {
+  const out = {};
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && value !== '') out[name] = value;
+  }
+  return out;
+}
+
 module.exports = {
   apps: [
     {
@@ -86,19 +102,21 @@ module.exports = {
         // `pm2 logs` shows nothing until the buffer fills and the process
         // looks hung.
         PYTHONUNBUFFERED: '1',
-        TUNNEL_TOKEN: process.env.TUNNEL_TOKEN || '',
-        // Faces the internet — token-authenticated agent endpoint.
-        TUNNEL_PUBLIC_PORT: process.env.TUNNEL_PUBLIC_PORT || '9000',
-        TUNNEL_PUBLIC_BIND: process.env.TUNNEL_PUBLIC_BIND || '0.0.0.0',
-        // Unauthenticated forwarding surface — firewall this to your
-        // container network. 0.0.0.0 is needed for Docker containers to
-        // reach it via host.docker.internal.
-        TUNNEL_LOCAL_PORT: process.env.TUNNEL_LOCAL_PORT || '9001',
-        TUNNEL_LOCAL_BIND: process.env.TUNNEL_LOCAL_BIND || '0.0.0.0',
-        // A cold 14B model load measured ~20s to first token; keep headroom.
-        TUNNEL_FIRST_BYTE_TIMEOUT: process.env.TUNNEL_FIRST_BYTE_TIMEOUT || '120',
-        TUNNEL_IDLE_TIMEOUT: process.env.TUNNEL_IDLE_TIMEOUT || '300',
-        TUNNEL_WS_OPEN_TIMEOUT: process.env.TUNNEL_WS_OPEN_TIMEOUT || '30',
+        // Everything else comes from .env unless it is exported in the shell
+        // that runs pm2. Do NOT default these to '' here - see passThrough.
+        ...passThrough([
+          'TUNNEL_TOKEN',
+          'TUNNEL_PUBLIC_PORT',
+          'TUNNEL_PUBLIC_BIND',
+          'TUNNEL_LOCAL_PORT',
+          'TUNNEL_LOCAL_BIND',
+          'TUNNEL_FIRST_BYTE_TIMEOUT',
+          'TUNNEL_IDLE_TIMEOUT',
+          'TUNNEL_WS_OPEN_TIMEOUT',
+          'TUNNEL_FALLBACKS',
+          'TUNNEL_FALLBACK_ON_ERROR',
+          'TUNNEL_FALLBACK_STRIP_PREFIX',
+        ]),
       },
     },
   ],
