@@ -106,6 +106,21 @@ CONNECT_TIMEOUT = float(os.getenv("TUNNEL_CONNECT_TIMEOUT", "10"))
 READ_TIMEOUT = float(os.getenv("TUNNEL_READ_TIMEOUT", "600"))
 CHUNK_SIZE = int(os.getenv("TUNNEL_CHUNK_SIZE", "8192"))
 
+# WebSocket keepalive.
+#
+# These were 25/10, and that is what actually broke a FAISS rebuild: a single
+# /api/embed carrying thousands of texts kept the client busy for minutes, the
+# pong was late, and websocket-client tore the connection down mid-request.
+# The head then answered the retry with "tunnel client offline" (503) and the
+# rebuild died - looking like a payload-size limit when it was a keepalive.
+#
+# Batching the embeddings is the real fix, since it keeps any one request
+# short. This is the second line of defence for anything else slow enough to
+# stall a pong, and it is configurable so a slow endpoint does not require a
+# code change. websocket-client requires ping_timeout < ping_interval.
+PING_INTERVAL = float(os.getenv("TUNNEL_PING_INTERVAL", "30"))
+PING_TIMEOUT = float(os.getenv("TUNNEL_PING_TIMEOUT", "25"))
+
 RECONNECT_MIN = 1.0
 RECONNECT_MAX = 30.0
 
@@ -567,7 +582,9 @@ class TunnelClient:
             try:
                 # ping_interval keeps NAT tables and intermediate proxies from
                 # dropping an idle tunnel.
-                self.ws.run_forever(ping_interval=25, ping_timeout=10)
+                self.ws.run_forever(
+                    ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT
+                )
             except Exception as exc:
                 logger.error(f"tunnel: run_forever crashed: {exc}")
 
