@@ -56,7 +56,9 @@ class ProxyCore:
         if not validate_request(request):
             return {"error": "Invalid request"}, 400
             
-        if not check_rate_limit(request):
+        # Pass the path: without it the limiter cannot tell which route this
+        # is, and RATE_LIMIT_EXEMPT_ROUTES (/ollama) would never match.
+        if not check_rate_limit(request, path):
             return {"error": "Rate limit exceeded"}, 429
             
         # Handle regular HTTP request

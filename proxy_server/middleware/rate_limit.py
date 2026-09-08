@@ -57,11 +57,36 @@ def get_client_id(request):
     # Fall back to IP address
     return f"ip:{request.remote_addr}"
 
-def check_rate_limit(request):
-    """Check if request is within rate limits"""
+def is_exempt_route(path):
+    """True if ``path`` sits under a RATE_LIMIT_EXEMPT_ROUTES prefix.
+
+    Callers hand us the path in both shapes — the /ollama rule builds
+    '/ollama/api/embed' while Werkzeug's catch-all yields 'api/embed' with no
+    leading slash — so normalise before matching. Matching on the prefix plus
+    a '/' boundary keeps '/ollama-admin' from inheriting '/ollama''s exemption.
+    """
+    if not path:
+        return False
+
+    normalised = path if path.startswith('/') else '/' + path
+    for prefix in current_app.config.get('RATE_LIMIT_EXEMPT_ROUTES', ()):
+        if normalised == prefix or normalised.startswith(prefix + '/'):
+            return True
+    return False
+
+def check_rate_limit(request, path=None):
+    """Check if request is within rate limits.
+
+    ``path`` is optional so the rate_limit_middleware decorator below keeps
+    working unchanged; a caller that knows which route it is serving should
+    pass it, or the exemption list can never apply.
+    """
     if not current_app.config.get('RATE_LIMIT_ENABLED', True):
         return True
-    
+
+    if is_exempt_route(path):
+        return True
+
     client_id = get_client_id(request)
     rate_limiters = get_rate_limiter()
     bucket = rate_limiters[client_id]

@@ -106,9 +106,36 @@ class Config:
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*')
 
     # Rate limiting
+    #
+    # REQUESTS/WINDOW is a REFILL RATE, not an hourly allowance: the bucket
+    # hands one token back every WINDOW/REQUESTS seconds, so 100/3600 means
+    # one request per 36s once the opening burst is spent.
     RATE_LIMIT_ENABLED = os.getenv('RATE_LIMIT_ENABLED', 'True').lower() == 'true'
     RATE_LIMIT_REQUESTS = int(os.getenv('RATE_LIMIT_REQUESTS', 100))
     RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', 3600))
+
+    # Route prefixes the limiter does not apply to.
+    #
+    # /ollama by default, for the same reason it sits outside require_auth
+    # (see proxy_routes.proxy_ollama_request): the embedding client cannot
+    # send an API key, so get_client_id falls back to the caller's IP and the
+    # ENTIRE chatbot platform - every tenant, every visitor turn, every
+    # rebuild batch - draws from ONE bucket. At the default rate that was one
+    # embed per 36 seconds, which starved RAG on the live server: successful
+    # embeds landed exactly 36s apart while everything in between was rejected
+    # in 5ms without ever reaching the GPU. The dashboard's own
+    # /ollama/api/tags probe was 429d by that same bucket and rendered
+    # "Unreachable. Is the daemon running on 11434?" while Ollama was serving
+    # health checks in ~300us.
+    #
+    # Exempting the route gives up nothing that was being protected: /ollama
+    # is reachable only behind the private tunnel head, so the limiter was
+    # throttling our own GPU consumer rather than an attacker. Set the env var
+    # to an empty string to enforce limits everywhere again.
+    RATE_LIMIT_EXEMPT_ROUTES = tuple(
+        r.strip() for r in os.getenv('RATE_LIMIT_EXEMPT_ROUTES', '/ollama').split(',')
+        if r.strip()
+    )
 
     # Performance ★ ENHANCED ★
     REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 90))  # Increased from 30
